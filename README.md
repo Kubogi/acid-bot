@@ -36,7 +36,7 @@ You will use this value as `GUILD_ID`.
 
 ## 3. Deploy on an Ubuntu or Debian VPS
 
-SSH into the VPS using your normal account. Running as `root` is acceptable for this intentionally simple setup; no additional Linux user or service is required.
+Use Ubuntu 22.04 or newer, or Debian 12 or newer, so the distribution provides Python 3.10+. SSH into the VPS using your normal account. Running as `root` is acceptable for this intentionally simple setup; no additional Linux user or service is required.
 
 Install Git, Python, the Discord voice dependencies, and `tmux`:
 
@@ -144,7 +144,7 @@ Run `/voice leave` before intentionally removing it from voice. This disables re
 
 ## Local development and tests
 
-Python 3.10 or newer is recommended.
+Python 3.10 or newer is required.
 
 ```bash
 python -m venv .venv
