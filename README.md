@@ -1,6 +1,6 @@
 # Acid Bot
 
-Acid Bot is a small Discord bot that stays in one voice channel until an administrator tells it to leave. It remembers the selected channel across restarts, reconnects after network failures or kicks, and does not play or record audio.
+Acid Bot is a small Discord bot that stays in one voice channel until an authorized controller tells it to leave. It remembers the selected channel across restarts, reconnects after network failures or kicks, and does not play or record audio.
 
 ## What it does
 
@@ -10,7 +10,7 @@ Acid Bot is a small Discord bot that stays in one voice channel until an adminis
 - `/voice rejoin` — reconnect to the last saved channel and turn recovery back on.
 - `/voice status` — show the target, actual connection, uptime, and latest error.
 
-Every command requires the Discord **Manage Server** permission. Replies are visible only to the person who ran the command. The bot supports regular voice channels, not Stage channels.
+Only Discord user IDs listed in `AUTHORIZED_USER_IDS` can control the bot; server administrators are not automatically authorized. Replies are visible only to the person who ran the command. The bot supports regular voice channels, not Stage channels.
 
 ## 1. Create the Discord bot
 
@@ -27,22 +27,29 @@ Every command requires the Discord **Manage Server** permission. Replies are vis
 
 The bot intentionally does not request Administrator, Speak, Mute Members, or Move Members.
 
-## 2. Get your server ID
+## 2. Get your server and controller IDs
 
 1. In Discord, open **User Settings > Advanced** and enable **Developer Mode**.
 2. Right-click your server icon and select **Copy Server ID**.
+3. Right-click each person who should control the bot and select **Copy User ID**.
 
-You will use this value as `GUILD_ID`.
+Use the server ID as `GUILD_ID`. Put the controller IDs in `AUTHORIZED_USER_IDS`, separated by commas. At least one controller is required.
 
 ## 3. Deploy on an Ubuntu or Debian VPS
 
 Use Ubuntu 22.04 or newer, or Debian 12 or newer, so the distribution provides Python 3.10+. SSH into the VPS using your normal account. Running as `root` is acceptable for this intentionally simple setup; no additional Linux user or service is required.
 
-Install Git, Python, the Discord voice dependencies, and `tmux`:
+Install Git, Python, the Discord voice dependencies, Node.js, and npm:
 
 ```bash
 apt update
-apt install -y git python3 python3-venv python3-dev libffi-dev libnacl-dev tmux
+apt install -y git python3 python3-venv python3-dev libffi-dev libnacl-dev nodejs npm
+```
+
+Install PM2 globally:
+
+```bash
+npm install -g pm2
 ```
 
 Clone this public repository and enter it:
@@ -68,11 +75,12 @@ cp .env.example .env
 nano .env
 ```
 
-Replace the sample values with your bot token and server ID:
+Replace the sample values with your bot token, server ID, and controller user IDs:
 
 ```dotenv
 DISCORD_TOKEN=your-real-bot-token
 GUILD_ID=your-server-id
+AUTHORIZED_USER_IDS=your-user-id,another-controller-user-id
 ```
 
 Save in `nano` with <kbd>Ctrl</kbd>+<kbd>O</kbd>, press <kbd>Enter</kbd>, then exit with <kbd>Ctrl</kbd>+<kbd>X</kbd>. Restrict the file so only your VPS user can read it:
@@ -89,52 +97,50 @@ python bot.py
 
 Wait for logs saying the bot logged in and synced its command group. In Discord, type `/voice status`. If the command responds, stop the foreground process with <kbd>Ctrl</kbd>+<kbd>C</kbd>.
 
-## 4. Keep it running with tmux
+## 4. Keep it running with PM2
 
-Create a named terminal session:
-
-```bash
-tmux new -s acid-bot
-```
-
-Inside that session, start the bot:
+The included `ecosystem.config.js` tells PM2 to run `bot.py` with the virtual environment's Python interpreter. Start it from the repository directory and save the process list:
 
 ```bash
 cd ~/acid-bot
-source .venv/bin/activate
-python bot.py
+pm2 start ecosystem.config.js
+pm2 save
 ```
 
-If you cloned the project somewhere other than `~/acid-bot`, use that path instead. Detach without stopping the bot by pressing <kbd>Ctrl</kbd>+<kbd>B</kbd>, releasing both keys, and then pressing <kbd>D</kbd>.
+If you cloned the project somewhere other than `~/acid-bot`, use that path instead. PM2 now keeps the bot running after you disconnect from SSH and restarts it if the process crashes.
 
 Useful commands:
 
 ```bash
-# Reopen the bot console and view live logs
-tmux attach -t acid-bot
+# Show process health
+pm2 status
 
-# List sessions
-tmux ls
+# Follow live logs
+pm2 logs acid-bot
 
-# Stop the bot after attaching
-# Press Ctrl+C in its console
+# Restart or stop the bot
+pm2 restart acid-bot
+pm2 stop acid-bot
 ```
 
-`tmux` keeps the bot running when you disconnect from SSH. It does **not** start the bot automatically after the VPS reboots. After a reboot, repeat the `tmux new -s acid-bot` and startup commands above.
+This setup intentionally does not run `pm2 startup`, because that command creates a system service. After the VPS itself reboots, restore the saved process list manually:
+
+```bash
+pm2 resurrect
+```
 
 ## Updating the bot
 
-Attach to the session and stop the bot with <kbd>Ctrl</kbd>+<kbd>C</kbd>, then run:
+Pull the latest code, update dependencies, and restart the PM2 process:
 
 ```bash
 cd ~/acid-bot
 git pull --ff-only
 source .venv/bin/activate
 python -m pip install -r requirements.txt
-python bot.py
+pm2 restart acid-bot
+pm2 save
 ```
-
-Detach from `tmux` again after the bot starts.
 
 ## Using the bot
 
@@ -162,6 +168,12 @@ python bot.py
 - Confirm `GUILD_ID` is the ID of the server where the bot was installed.
 - Reinstall the bot with both `bot` and `applications.commands` scopes.
 - Restart the process and look for the `Synced 1 command group(s)` log entry.
+
+### You are not authorized to control the bot
+
+- Copy your Discord user ID again and confirm it appears in `AUTHORIZED_USER_IDS`.
+- Use raw numeric IDs separated by commas, not usernames or `@mentions`.
+- Restart the process with `pm2 restart acid-bot` after changing `.env`.
 
 ### The bot cannot connect
 

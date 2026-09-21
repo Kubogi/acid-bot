@@ -8,7 +8,6 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
-from discord import app_commands
 
 from bot import (
     Config,
@@ -16,26 +15,45 @@ from bot import (
     PersistentVoiceState,
     RetryBackoff,
     StateStore,
+    UnauthorizedUser,
     VoiceManager,
     VoiceOperationError,
     format_uptime,
-    require_manage_guild,
+    require_authorized_user,
 )
 
 
 class ConfigTests(unittest.TestCase):
     def test_loads_valid_environment(self):
-        with patch.dict(os.environ, {"DISCORD_TOKEN": "secret", "GUILD_ID": "123"}, clear=True):
+        environment = {
+            "DISCORD_TOKEN": "secret",
+            "GUILD_ID": "123",
+            "AUTHORIZED_USER_IDS": "42, 99,42",
+        }
+        with patch.dict(os.environ, environment, clear=True):
             config = Config.from_env(Path("state.json"))
         self.assertEqual(config.token, "secret")
         self.assertEqual(config.guild_id, 123)
+        self.assertEqual(config.authorized_user_ids, frozenset({42, 99}))
 
     def test_rejects_missing_or_invalid_values(self):
         cases = [
             {},
             {"DISCORD_TOKEN": "secret"},
-            {"DISCORD_TOKEN": "secret", "GUILD_ID": "not-a-number"},
-            {"DISCORD_TOKEN": "secret", "GUILD_ID": "0"},
+            {
+                "DISCORD_TOKEN": "secret",
+                "GUILD_ID": "not-a-number",
+                "AUTHORIZED_USER_IDS": "42",
+            },
+            {"DISCORD_TOKEN": "secret", "GUILD_ID": "0", "AUTHORIZED_USER_IDS": "42"},
+            {"DISCORD_TOKEN": "secret", "GUILD_ID": "123"},
+            {
+                "DISCORD_TOKEN": "secret",
+                "GUILD_ID": "123",
+                "AUTHORIZED_USER_IDS": "not-a-number",
+            },
+            {"DISCORD_TOKEN": "secret", "GUILD_ID": "123", "AUTHORIZED_USER_IDS": "0"},
+            {"DISCORD_TOKEN": "secret", "GUILD_ID": "123", "AUTHORIZED_USER_IDS": "42,"},
         ]
         for environment in cases:
             with self.subTest(environment=environment):
@@ -178,19 +196,19 @@ class UtilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(format_uptime(65), "1m 5s")
         self.assertEqual(format_uptime(90_061), "1d 1h 1m 1s")
 
-    async def test_manage_server_permission_is_required(self):
+    async def test_user_must_be_in_controller_allowlist(self):
         allowed = SimpleNamespace(
             guild=object(),
-            user=SimpleNamespace(guild_permissions=SimpleNamespace(manage_guild=True)),
+            user=SimpleNamespace(id=42),
         )
         denied = SimpleNamespace(
             guild=object(),
-            user=SimpleNamespace(guild_permissions=SimpleNamespace(manage_guild=False)),
+            user=SimpleNamespace(id=7),
         )
 
-        self.assertTrue(await require_manage_guild(allowed))
-        with self.assertRaises(app_commands.MissingPermissions):
-            await require_manage_guild(denied)
+        self.assertTrue(await require_authorized_user(allowed, frozenset({42, 99})))
+        with self.assertRaises(UnauthorizedUser):
+            await require_authorized_user(denied, frozenset({42, 99}))
 
 
 if __name__ == "__main__":

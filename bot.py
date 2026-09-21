@@ -28,10 +28,15 @@ class VoiceOperationError(RuntimeError):
     """Raised when a requested voice operation cannot be completed."""
 
 
+class UnauthorizedUser(app_commands.CheckFailure):
+    """Raised when a user is not included in the controller allowlist."""
+
+
 @dataclass(frozen=True)
 class Config:
     token: str
     guild_id: int
+    authorized_user_ids: frozenset[int]
     state_path: Path = DEFAULT_STATE_PATH
 
     @classmethod
@@ -40,11 +45,14 @@ class Config:
 
         token = os.getenv("DISCORD_TOKEN", "").strip()
         raw_guild_id = os.getenv("GUILD_ID", "").strip()
+        raw_authorized_user_ids = os.getenv("AUTHORIZED_USER_IDS", "").strip()
 
         if not token:
             raise ConfigurationError("DISCORD_TOKEN is missing. Add it to .env.")
         if not raw_guild_id:
             raise ConfigurationError("GUILD_ID is missing. Add it to .env.")
+        if not raw_authorized_user_ids:
+            raise ConfigurationError("AUTHORIZED_USER_IDS is missing. Add it to .env.")
 
         try:
             guild_id = int(raw_guild_id)
@@ -54,7 +62,31 @@ class Config:
         if guild_id <= 0:
             raise ConfigurationError("GUILD_ID must be a positive integer.")
 
-        return cls(token=token, guild_id=guild_id, state_path=state_path)
+        authorized_user_ids: set[int] = set()
+        for raw_user_id in raw_authorized_user_ids.split(","):
+            value = raw_user_id.strip()
+            if not value:
+                raise ConfigurationError(
+                    "AUTHORIZED_USER_IDS must be a comma-separated list of positive integers."
+                )
+            try:
+                user_id = int(value)
+            except ValueError as exc:
+                raise ConfigurationError(
+                    "AUTHORIZED_USER_IDS must be a comma-separated list of positive integers."
+                ) from exc
+            if user_id <= 0:
+                raise ConfigurationError(
+                    "AUTHORIZED_USER_IDS must be a comma-separated list of positive integers."
+                )
+            authorized_user_ids.add(user_id)
+
+        return cls(
+            token=token,
+            guild_id=guild_id,
+            authorized_user_ids=frozenset(authorized_user_ids),
+            state_path=state_path,
+        )
 
 
 @dataclass
@@ -322,18 +354,26 @@ def format_uptime(total_seconds: int) -> str:
     return " ".join(parts)
 
 
-async def require_manage_guild(interaction: discord.Interaction) -> bool:
-    permissions = getattr(interaction.user, "guild_permissions", None)
-    if interaction.guild is None or permissions is None or not permissions.manage_guild:
-        raise app_commands.MissingPermissions(["manage_guild"])
+async def require_authorized_user(
+    interaction: discord.Interaction,
+    authorized_user_ids: frozenset[int],
+) -> bool:
+    if interaction.guild is None or interaction.user.id not in authorized_user_ids:
+        raise UnauthorizedUser("This user is not authorized to control the bot.")
     return True
 
 
-def build_voice_commands(manager: VoiceManager) -> app_commands.Group:
+def build_voice_commands(
+    manager: VoiceManager,
+    authorized_user_ids: frozenset[int],
+) -> app_commands.Group:
     group = app_commands.Group(name="voice", description="Manage the persistent voice connection")
 
+    async def authorize(interaction: discord.Interaction) -> bool:
+        return await require_authorized_user(interaction, authorized_user_ids)
+
     @group.command(name="join", description="Join your current voice channel and keep reconnecting")
-    @app_commands.check(require_manage_guild)
+    @app_commands.check(authorize)
     async def join(interaction: discord.Interaction) -> None:
         member = interaction.user
         channel = member.voice.channel if isinstance(member, discord.Member) and member.voice else None
@@ -361,7 +401,7 @@ def build_voice_commands(manager: VoiceManager) -> app_commands.Group:
 
     @group.command(name="move", description="Move to a selected voice channel and save it")
     @app_commands.describe(channel="The voice channel the bot should stay in")
-    @app_commands.check(require_manage_guild)
+    @app_commands.check(authorize)
     async def move(interaction: discord.Interaction, channel: discord.VoiceChannel) -> None:
         await interaction.response.defer(ephemeral=True, thinking=True)
         try:
@@ -379,7 +419,7 @@ def build_voice_commands(manager: VoiceManager) -> app_commands.Group:
         )
 
     @group.command(name="leave", description="Disconnect and disable automatic recovery")
-    @app_commands.check(require_manage_guild)
+    @app_commands.check(authorize)
     async def leave(interaction: discord.Interaction) -> None:
         await interaction.response.defer(ephemeral=True, thinking=True)
         try:
@@ -394,7 +434,7 @@ def build_voice_commands(manager: VoiceManager) -> app_commands.Group:
         )
 
     @group.command(name="rejoin", description="Reconnect to the saved target and enable recovery")
-    @app_commands.check(require_manage_guild)
+    @app_commands.check(authorize)
     async def rejoin(interaction: discord.Interaction) -> None:
         await interaction.response.defer(ephemeral=True, thinking=True)
         try:
@@ -409,7 +449,7 @@ def build_voice_commands(manager: VoiceManager) -> app_commands.Group:
         )
 
     @group.command(name="status", description="Show the current voice connection state")
-    @app_commands.check(require_manage_guild)
+    @app_commands.check(authorize)
     async def status(interaction: discord.Interaction) -> None:
         snapshot = manager.status()
         target_id = snapshot["target_channel_id"]
@@ -446,7 +486,10 @@ class VoiceBot(commands.Bot):
 
     async def setup_hook(self) -> None:
         guild = discord.Object(id=self.config.guild_id)
-        self.tree.add_command(build_voice_commands(self.voice_manager), guild=guild)
+        self.tree.add_command(
+            build_voice_commands(self.voice_manager, self.config.authorized_user_ids),
+            guild=guild,
+        )
         synced = await self.tree.sync(guild=guild)
         LOGGER.info("Synced %d command group(s) to guild %s", len(synced), self.config.guild_id)
         self.voice_manager.start()
@@ -479,8 +522,8 @@ class VoiceBot(commands.Bot):
         interaction: discord.Interaction,
         error: app_commands.AppCommandError,
     ) -> None:
-        if isinstance(error, app_commands.MissingPermissions):
-            message = "You need the Manage Server permission to use this command."
+        if isinstance(error, UnauthorizedUser):
+            message = "You are not authorized to control this bot."
         else:
             LOGGER.error(
                 "Unhandled application command error",
