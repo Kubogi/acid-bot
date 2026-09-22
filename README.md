@@ -181,6 +181,26 @@ python bot.py
 - A full channel may reject the bot because it intentionally does not request **Move Members**.
 - Run `/voice status` to see the latest connection error.
 
+### Diagnose a random voice disconnect
+
+Capture the surrounding log lines and PM2 process information before restarting:
+
+```bash
+pm2 logs acid-bot --lines 300 --nostream
+pm2 describe acid-bot
+```
+
+The bot logs safe connection metadata, but never voice tokens or Discord bot credentials. Look for these entries in chronological order:
+
+- `Voice websocket closed`: includes Discord's numeric close code, a plain-language cause, endpoint, connection state, and latency.
+- `Discord gateway disconnected` followed by `session resumed`: points to a main gateway or VPS network interruption.
+- `Voice server update received`: `endpoint_changed=True` indicates Discord moved the call to another voice server.
+- `Bot voice state changed`: shows external disconnects or moves and whether the Discord voice session changed.
+- `Replacing existing disconnected voice client`: shows the recovery watchdog acted while an old voice client still existed. If its flow state is not `disconnected`, an internal reconnect may have been in progress.
+- `Starting acid-bot diagnostics`: shows the OS PID and PM2 app ID. A new OS PID indicates that the process restarted.
+
+Common close codes are `4014` for an individual disconnect such as a kick or lost main gateway session, `4015` for a Discord voice-server crash, `4021` for rate limiting, and `4022` when Discord terminates or migrates a call.
+
 ### Voice dependencies fail to install
 
 Run the package installation command from the deployment section again, then recreate the virtual environment if necessary:

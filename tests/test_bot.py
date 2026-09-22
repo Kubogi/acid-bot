@@ -12,14 +12,18 @@ import discord
 from bot import (
     Config,
     ConfigurationError,
+    DiagnosticVoiceClient,
     PersistentVoiceState,
     RetryBackoff,
     StateStore,
     UnauthorizedUser,
     VoiceManager,
     VoiceOperationError,
+    describe_voice_close,
+    format_latency,
     format_uptime,
     require_authorized_user,
+    voice_latency_for,
 )
 
 
@@ -127,7 +131,12 @@ class VoiceManagerTests(unittest.IsolatedAsyncioTestCase):
         channel = self.make_channel()
         await self.manager.connect_to(channel)
 
-        channel.connect.assert_awaited_once_with(timeout=30.0, reconnect=True, self_deaf=True)
+        channel.connect.assert_awaited_once_with(
+            timeout=30.0,
+            reconnect=True,
+            self_deaf=True,
+            cls=DiagnosticVoiceClient,
+        )
         self.assertEqual(self.store.load(), PersistentVoiceState(456, True))
         self.assertIsNone(self.manager.last_error)
 
@@ -195,6 +204,20 @@ class UtilityTests(unittest.IsolatedAsyncioTestCase):
     def test_formats_uptime(self):
         self.assertEqual(format_uptime(65), "1m 5s")
         self.assertEqual(format_uptime(90_061), "1d 1h 1m 1s")
+
+    def test_describes_voice_close_codes(self):
+        self.assertIn("gateway", describe_voice_close(4014))
+        self.assertIn("server crashed", describe_voice_close(4015))
+        self.assertIn("unknown", describe_voice_close(4999))
+
+    def test_formats_latency_safely(self):
+        self.assertEqual(format_latency(0.1234), "123ms")
+        self.assertEqual(format_latency(float("inf")), "unavailable")
+        self.assertEqual(format_latency(None), "unavailable")
+
+        client = MagicMock()
+        type(client).latency = property(lambda _: (_ for _ in ()).throw(RuntimeError("closed")))
+        self.assertEqual(voice_latency_for(client), "unavailable")
 
     async def test_user_must_be_in_controller_allowlist(self):
         allowed = SimpleNamespace(

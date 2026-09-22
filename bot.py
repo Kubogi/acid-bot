@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
+import platform
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,13 +13,166 @@ from typing import Any
 
 import discord
 from discord import app_commands
+from discord.errors import ConnectionClosed
 from discord.ext import commands
+from discord.gateway import DiscordVoiceWebSocket
+from discord.voice_state import ConnectionFlowState, VoiceConnectionState
 from dotenv import load_dotenv
 
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_STATE_PATH = BASE_DIR / "data" / "voice_state.json"
 LOGGER = logging.getLogger("acid_bot")
+
+
+VOICE_CLOSE_CAUSES = {
+    1000: "normal closure",
+    4006: "voice session is no longer valid",
+    4009: "voice session timed out",
+    4011: "voice server was not found",
+    4014: "Discord disconnected this client (kick, move, or main gateway loss)",
+    4015: "Discord voice server crashed",
+    4017: "the channel requires E2EE/DAVE support",
+    4021: "voice connection was rate limited",
+    4022: "call terminated (channel deletion or voice server change)",
+}
+
+
+def describe_voice_close(code: int) -> str:
+    return VOICE_CLOSE_CAUSES.get(code, "unknown or undocumented voice close reason")
+
+
+def format_latency(value: float | None) -> str:
+    if not isinstance(value, (int, float)) or not math.isfinite(value):
+        return "unavailable"
+    return f"{value * 1000:.0f}ms"
+
+
+def gateway_latency_for(client: discord.VoiceClient) -> str:
+    try:
+        websocket = client._state._get_websocket(client.guild.id)
+        return format_latency(websocket.latency)
+    except Exception:
+        return "unavailable"
+
+
+def voice_latency_for(client: discord.VoiceClient) -> str:
+    try:
+        return format_latency(client.latency)
+    except Exception:
+        return "unavailable"
+
+
+class DiagnosticVoiceWebSocket(DiscordVoiceWebSocket):
+    """Voice WebSocket that records close codes without logging sensitive payloads."""
+
+    async def poll_event(self) -> None:
+        try:
+            await super().poll_event()
+        except ConnectionClosed as exc:
+            state = self._connection
+            client = state.voice_client
+            client.last_voice_close_code = exc.code
+            client.last_voice_close_at = time.monotonic()
+            LOGGER.warning(
+                "Voice websocket closed: code=%s cause=%s flow_state=%s "
+                "guild_id=%s channel_id=%s endpoint=%s voice_latency=%s gateway_latency=%s",
+                exc.code,
+                describe_voice_close(exc.code),
+                state.state.name,
+                client.guild.id,
+                client.channel.id,
+                state.endpoint,
+                voice_latency_for(client),
+                gateway_latency_for(client),
+            )
+            raise
+        except asyncio.TimeoutError:
+            state = self._connection
+            client = state.voice_client
+            LOGGER.warning(
+                "Voice websocket receive timed out after 30s: flow_state=%s guild_id=%s "
+                "channel_id=%s endpoint=%s voice_latency=%s gateway_latency=%s",
+                state.state.name,
+                client.guild.id,
+                client.channel.id,
+                state.endpoint,
+                voice_latency_for(client),
+                gateway_latency_for(client),
+            )
+            raise
+
+
+class DiagnosticVoiceConnectionState(VoiceConnectionState):
+    async def _connect_websocket(self, resume: bool) -> DiscordVoiceWebSocket:
+        previous_ws = getattr(self, "ws", None)
+        seq_ack = getattr(previous_ws, "seq_ack", -1)
+        LOGGER.info(
+            "Opening voice websocket: resume=%s flow_state=%s guild_id=%s "
+            "channel_id=%s endpoint=%s",
+            resume,
+            self.state.name,
+            self.guild.id,
+            self.voice_client.channel.id,
+            self.endpoint,
+        )
+        ws = await DiagnosticVoiceWebSocket.from_connection_state(
+            self,
+            resume=resume,
+            hook=self.hook,
+            seq_ack=seq_ack,
+        )
+        self.state = ConnectionFlowState.websocket_connected
+        return ws
+
+    async def voice_state_update(self, data: dict[str, Any]) -> None:
+        previous_state = self.state.name
+        previous_session_id = self.session_id
+        await super().voice_state_update(data)
+        LOGGER.info(
+            "Raw bot voice state update processed: channel_id=%s session_changed=%s "
+            "flow_state=%s->%s disconnected_signal=%s expecting_disconnect=%s",
+            data.get("channel_id"),
+            previous_session_id is not None and data.get("session_id") != previous_session_id,
+            previous_state,
+            self.state.name,
+            self._disconnected.is_set(),
+            self._expecting_disconnect,
+        )
+
+    async def voice_server_update(self, data: dict[str, Any]) -> None:
+        previous_state = self.state.name
+        previous_endpoint = self.endpoint
+        previous_token = self.token
+        LOGGER.info(
+            "Voice server update received: guild_id=%s endpoint=%s endpoint_changed=%s "
+            "token_changed=%s flow_state=%s",
+            data.get("guild_id"),
+            data.get("endpoint"),
+            previous_endpoint is not None and data.get("endpoint") != previous_endpoint,
+            previous_token is not None and data.get("token") != previous_token,
+            previous_state,
+        )
+        await super().voice_server_update(data)
+        LOGGER.info(
+            "Voice server update processed: flow_state=%s->%s endpoint=%s",
+            previous_state,
+            self.state.name,
+            self.endpoint,
+        )
+
+
+class DiagnosticVoiceClient(discord.VoiceClient):
+    last_voice_close_code: int | None
+    last_voice_close_at: float | None
+
+    def __init__(self, client: discord.Client, channel: discord.abc.Connectable) -> None:
+        self.last_voice_close_code = None
+        self.last_voice_close_at = None
+        super().__init__(client, channel)
+
+    def create_connection_state(self) -> VoiceConnectionState:
+        return DiagnosticVoiceConnectionState(self)
 
 
 class ConfigurationError(ValueError):
@@ -166,6 +321,7 @@ class VoiceManager:
         self._wake = asyncio.Event()
         self._watchdog_task: asyncio.Task[None] | None = None
         self._backoff = RetryBackoff()
+        self._connection_attempts = 0
 
     def start(self) -> None:
         if self._watchdog_task is None or self._watchdog_task.done():
@@ -216,6 +372,7 @@ class VoiceManager:
                     timeout=30.0,
                     reconnect=True,
                     self_deaf=True,
+                    cls=DiagnosticVoiceClient,
                 )
             except Exception as exc:
                 self._remember_error(exc)
@@ -293,13 +450,51 @@ class VoiceManager:
             return
 
         if voice_client is not None:
+            connection_state = getattr(getattr(voice_client, "_connection", None), "state", None)
+            last_close_code = getattr(voice_client, "last_voice_close_code", None)
+            last_close_at = getattr(voice_client, "last_voice_close_at", None)
+            close_age = (
+                f"{time.monotonic() - last_close_at:.1f}s"
+                if last_close_at is not None
+                else "unavailable"
+            )
+            LOGGER.warning(
+                "Replacing existing disconnected voice client: client_id=%s flow_state=%s "
+                "current_channel_id=%s target_channel_id=%s last_close_code=%s "
+                "last_close_age=%s (an in-progress library reconnect may be racing recovery)",
+                id(voice_client),
+                getattr(connection_state, "name", "unknown"),
+                getattr(getattr(voice_client, "channel", None), "id", None),
+                channel.id,
+                last_close_code,
+                close_age,
+            )
             await voice_client.disconnect(force=True)
 
-        LOGGER.info("Connecting to voice channel %s (%s)", channel.name, channel.id)
-        await channel.connect(
+        self._connection_attempts += 1
+        attempt = self._connection_attempts
+        started_at = time.monotonic()
+        LOGGER.info(
+            "Starting managed voice connection: attempt=%s channel=%s channel_id=%s",
+            attempt,
+            channel.name,
+            channel.id,
+        )
+        connected_client = await channel.connect(
             timeout=30.0,
             reconnect=True,
             self_deaf=True,
+            cls=DiagnosticVoiceClient,
+        )
+        LOGGER.info(
+            "Managed voice connection succeeded: attempt=%s elapsed=%.2fs client_id=%s "
+            "endpoint=%s voice_latency=%s gateway_latency=%s",
+            attempt,
+            time.monotonic() - started_at,
+            id(connected_client),
+            getattr(connected_client, "endpoint", None),
+            voice_latency_for(connected_client),
+            gateway_latency_for(connected_client),
         )
 
     async def _watchdog(self) -> None:
@@ -483,6 +678,8 @@ class VoiceBot(commands.Bot):
         self.config = config
         self.voice_manager = VoiceManager(self, config.guild_id, StateStore(config.state_path))
         self.tree.on_error = self.on_app_command_error
+        self._gateway_connect_count = 0
+        self._gateway_disconnected_at: float | None = None
 
     async def setup_hook(self) -> None:
         guild = discord.Object(id=self.config.guild_id)
@@ -503,19 +700,76 @@ class VoiceBot(commands.Bot):
             LOGGER.info("Configured guild: %s (%s)", guild.name, guild.id)
         self.voice_manager.wake()
 
+    async def on_connect(self) -> None:
+        self._gateway_connect_count += 1
+        disconnected_for = (
+            f"{time.monotonic() - self._gateway_disconnected_at:.2f}s"
+            if self._gateway_disconnected_at is not None
+            else "initial connection"
+        )
+        LOGGER.info(
+            "Discord gateway connected: connection_number=%s disconnected_for=%s latency=%s",
+            self._gateway_connect_count,
+            disconnected_for,
+            format_latency(self.latency),
+        )
+
+    async def on_disconnect(self) -> None:
+        self._gateway_disconnected_at = time.monotonic()
+        snapshot = self.voice_manager.status()
+        actual_channel = snapshot["actual_channel"]
+        LOGGER.warning(
+            "Discord gateway disconnected: latency=%s voice_connected=%s "
+            "voice_channel_id=%s recovery_enabled=%s target_channel_id=%s",
+            format_latency(self.latency),
+            snapshot["connected"],
+            getattr(actual_channel, "id", None),
+            snapshot["enabled"],
+            snapshot["target_channel_id"],
+        )
+
+    async def on_resumed(self) -> None:
+        disconnected_for = (
+            f"{time.monotonic() - self._gateway_disconnected_at:.2f}s"
+            if self._gateway_disconnected_at is not None
+            else "unknown"
+        )
+        LOGGER.info(
+            "Discord gateway session resumed: disconnected_for=%s latency=%s",
+            disconnected_for,
+            format_latency(self.latency),
+        )
+        self._gateway_disconnected_at = None
+
     async def on_voice_state_update(
         self,
         member: discord.Member,
         before: discord.VoiceState,
         after: discord.VoiceState,
     ) -> None:
-        if self.user is not None and member.id == self.user.id and before.channel != after.channel:
+        if self.user is not None and member.id == self.user.id:
+            guild_voice_client = member.guild.voice_client
+            connection_state = getattr(
+                getattr(guild_voice_client, "_connection", None), "state", None
+            )
             LOGGER.info(
-                "Bot voice state changed from %s to %s",
+                "Bot voice state changed: before_channel_id=%s after_channel_id=%s "
+                "session_changed=%s self_mute=%s self_deaf=%s server_mute=%s "
+                "server_deaf=%s suppressed=%s voice_client_id=%s connected=%s flow_state=%s",
                 getattr(before.channel, "id", None),
                 getattr(after.channel, "id", None),
+                before.session_id != after.session_id,
+                after.self_mute,
+                after.self_deaf,
+                after.mute,
+                after.deaf,
+                after.suppress,
+                id(guild_voice_client) if guild_voice_client is not None else None,
+                guild_voice_client.is_connected() if guild_voice_client is not None else False,
+                getattr(connection_state, "name", "none"),
             )
-            self.voice_manager.wake()
+            if before.channel != after.channel:
+                self.voice_manager.wake()
 
     async def on_app_command_error(
         self,
@@ -545,6 +799,16 @@ def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+    LOGGER.info(
+        "Starting acid-bot diagnostics: pid=%s pm_id=%s python=%s discord_py=%s "
+        "platform=%s",
+        os.getpid(),
+        os.getenv("pm_id", "not-running-under-pm2"),
+        platform.python_version(),
+        discord.__version__,
+        platform.platform(),
     )
 
     try:
