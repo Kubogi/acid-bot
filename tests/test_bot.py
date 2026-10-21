@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,22 +10,17 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
 
-from bot import (
-    Config,
-    ConfigurationError,
+from acid_bot.commands import UnauthorizedUser, require_authorized_user
+from acid_bot.config import Config, ConfigurationError
+from acid_bot.diagnostics import (
     DiagnosticVoiceClient,
-    PersistentVoiceState,
-    RetryBackoff,
-    StateStore,
-    UnauthorizedUser,
-    VoiceManager,
-    VoiceOperationError,
     describe_voice_close,
     format_latency,
     format_uptime,
-    require_authorized_user,
     voice_latency_for,
 )
+from acid_bot.manager import RetryBackoff, VoiceManager, VoiceOperationError
+from acid_bot.state import PersistentVoiceState, StateStore
 
 
 class ConfigTests(unittest.TestCase):
@@ -37,8 +33,37 @@ class ConfigTests(unittest.TestCase):
         with patch.dict(os.environ, environment, clear=True):
             config = Config.from_env(Path("state.json"))
         self.assertEqual(config.token, "secret")
+        self.assertEqual(config.voice_tokens, ())
+        self.assertEqual(config.rotation_seconds, 10800.0)
         self.assertEqual(config.guild_id, 123)
         self.assertEqual(config.authorized_user_ids, frozenset({42, 99}))
+
+    def test_parses_voice_token_pool_and_rotation(self):
+        environment = {
+            "DISCORD_TOKEN": "secret",
+            "GUILD_ID": "123",
+            "AUTHORIZED_USER_IDS": "42",
+            "VOICE_BOT_TOKENS": "tok-a, tok-b ,secret,tok-a,",
+            "VOICE_ROTATION_SECONDS": "900",
+        }
+        with patch.dict(os.environ, environment, clear=True):
+            config = Config.from_env(Path("state.json"))
+        self.assertEqual(config.voice_tokens, ("tok-a", "tok-b"))
+        self.assertEqual(config.rotation_seconds, 900.0)
+
+    def test_rejects_invalid_rotation_seconds(self):
+        base = {
+            "DISCORD_TOKEN": "secret",
+            "GUILD_ID": "123",
+            "AUTHORIZED_USER_IDS": "42",
+        }
+        for value in ("abc", "-5", "0", "inf"):
+            with self.subTest(value=value):
+                with patch.dict(
+                    os.environ, {**base, "VOICE_ROTATION_SECONDS": value}, clear=True
+                ):
+                    with self.assertRaises(ConfigurationError):
+                        Config.from_env(Path("state.json"))
 
     def test_rejects_missing_or_invalid_values(self):
         cases = [
@@ -115,6 +140,9 @@ class VoiceManagerTests(unittest.IsolatedAsyncioTestCase):
         self.guild.get_channel = MagicMock()
 
         self.bot = MagicMock()
+        self.bot.is_closed.return_value = False
+        self.bot.is_ready.return_value = True
+        self.bot._acid_login_failed = False
         self.bot.get_guild.return_value = self.guild
         self.manager = VoiceManager(self.bot, 123, self.store)
 
@@ -126,6 +154,18 @@ class VoiceManagerTests(unittest.IsolatedAsyncioTestCase):
         channel.connect = AsyncMock(return_value=self.voice_client)
         self.guild.get_channel.return_value = channel
         return channel
+
+    def make_pool_member(self, voice_client=None, channel=None):
+        guild = MagicMock(spec=discord.Guild)
+        guild.voice_client = voice_client
+        guild.get_channel = MagicMock(return_value=channel)
+        client = MagicMock()
+        client.is_closed.return_value = False
+        client.is_ready.return_value = True
+        client._acid_login_failed = False
+        client.get_guild.return_value = guild
+        client.user = None
+        return client, guild
 
     async def test_connect_persists_target_and_enables_recovery(self):
         channel = self.make_channel()
@@ -157,6 +197,7 @@ class VoiceManagerTests(unittest.IsolatedAsyncioTestCase):
         self.store.save(PersistentVoiceState(456, True))
         self.manager.state = self.store.load()
         self.guild.voice_client = self.voice_client
+        self.manager._active_index = 0
 
         await self.manager.leave()
 
@@ -198,6 +239,144 @@ class VoiceManagerTests(unittest.IsolatedAsyncioTestCase):
             self.manager.connect_to(channel),
         )
         self.assertEqual(maximum_active, 1)
+
+    def make_connected_voice_client(self, channel, events=None, tag="disconnect"):
+        voice_client = MagicMock(spec=discord.VoiceClient)
+        voice_client.is_connected.return_value = True
+        voice_client.channel = channel
+        voice_client.move_to = AsyncMock()
+        if events is None:
+            voice_client.disconnect = AsyncMock()
+        else:
+            voice_client.disconnect = AsyncMock(
+                side_effect=lambda **kwargs: events.append(tag)
+            )
+        return voice_client
+
+    def make_unconnected_channel(self, channel, events=None, tag="connect"):
+        seat_channel = MagicMock(spec=discord.VoiceChannel)
+        seat_channel.id = channel.id
+        seat_channel.name = channel.name
+        new_voice_client = MagicMock(spec=discord.VoiceClient)
+        new_voice_client.channel = seat_channel
+        if events is None:
+            seat_channel.connect = AsyncMock(return_value=new_voice_client)
+        else:
+            async def connect(**kwargs):
+                events.append(tag)
+                return new_voice_client
+
+            seat_channel.connect = AsyncMock(side_effect=connect)
+        return seat_channel, new_voice_client
+
+    async def test_handover_connects_new_seat_before_releasing_old(self):
+        channel = self.make_channel()
+        events = []
+        old_voice_client = self.make_connected_voice_client(channel, events, "old_disconnect")
+        old_client, _ = self.make_pool_member(voice_client=old_voice_client)
+        new_channel, _ = self.make_unconnected_channel(channel, events, "new_connect")
+        new_client, _ = self.make_pool_member(channel=new_channel)
+
+        self.manager.set_pool([old_client, new_client])
+        self.manager._active_index = 0
+        self.manager._seat_since = time.monotonic()
+        self.manager.state = PersistentVoiceState(channel.id, True)
+
+        await self.manager.rejoin()
+
+        self.assertEqual(events, ["new_connect", "old_disconnect"])
+        self.assertEqual(self.manager._active_index, 1)
+
+    async def test_scheduled_rotation_swaps_seat(self):
+        channel = self.make_channel()
+        old_voice_client = self.make_connected_voice_client(channel)
+        old_client, _ = self.make_pool_member(voice_client=old_voice_client)
+        new_channel, _ = self.make_unconnected_channel(channel)
+        new_client, _ = self.make_pool_member(channel=new_channel)
+
+        self.manager.set_pool([old_client, new_client])
+        self.manager._active_index = 0
+        self.manager._seat_since = time.monotonic() - 9999
+        self.manager.rotation_seconds = 60
+        self.manager.state = PersistentVoiceState(channel.id, True)
+
+        await self.manager.ensure_connected()
+
+        new_channel.connect.assert_awaited_once()
+        old_voice_client.disconnect.assert_awaited_once_with(force=True)
+        self.assertEqual(self.manager._active_index, 1)
+
+    async def test_dead_seat_rotates_to_next_member(self):
+        channel = self.make_channel()
+        self.voice_client.is_connected.return_value = False
+        self.voice_client.channel = channel
+        self.guild.voice_client = self.voice_client
+        new_channel, _ = self.make_unconnected_channel(channel)
+        new_client, _ = self.make_pool_member(channel=new_channel)
+
+        self.manager.set_pool([self.bot, new_client])
+        self.manager._active_index = 0
+        self.manager._seat_since = time.monotonic()
+        self.manager.state = PersistentVoiceState(channel.id, True)
+
+        await self.manager.ensure_connected()
+
+        new_channel.connect.assert_awaited_once()
+        self.assertEqual(self.manager._active_index, 1)
+
+    async def test_connected_seat_in_single_member_pool_never_rotates(self):
+        channel = self.make_channel()
+        self.voice_client.is_connected.return_value = True
+        self.voice_client.channel = channel
+        self.guild.voice_client = self.voice_client
+        self.manager._active_index = 0
+        self.manager._seat_since = time.monotonic() - 999_999
+        self.manager.rotation_seconds = 60
+        self.manager.state = PersistentVoiceState(channel.id, True)
+
+        await self.manager.ensure_connected()
+
+        channel.connect.assert_not_awaited()
+        self.voice_client.disconnect.assert_not_awaited()
+        self.assertEqual(self.manager._active_index, 0)
+
+    async def test_rotation_failure_keeps_existing_seat(self):
+        channel = self.make_channel()
+        self.voice_client.is_connected.return_value = True
+        self.voice_client.channel = channel
+        self.guild.voice_client = self.voice_client
+
+        failing_client, failing_guild = self.make_pool_member()
+        failing_guild.get_channel.return_value = None
+
+        self.manager.set_pool([self.bot, failing_client])
+        self.manager._active_index = 0
+        self.manager._seat_since = time.monotonic() - 9999
+        self.manager.rotation_seconds = 60
+        self.manager.state = PersistentVoiceState(channel.id, True)
+
+        await self.manager.ensure_connected()
+
+        self.assertEqual(self.manager._active_index, 0)
+        self.voice_client.disconnect.assert_not_awaited()
+
+    def test_set_pool_requires_members(self):
+        with self.assertRaises(ValueError):
+            self.manager.set_pool([])
+
+    async def test_status_reports_seat_and_rotation(self):
+        channel = self.make_channel()
+        self.voice_client.is_connected.return_value = True
+        self.voice_client.channel = channel
+        self.guild.voice_client = self.voice_client
+        await self.manager.connect_to(channel)
+
+        snapshot = self.manager.status()
+
+        self.assertEqual(snapshot["pool_size"], 1)
+        self.assertTrue(snapshot["active_seat"].startswith("main[0]"))
+        self.assertIsNotNone(snapshot["seat_age_seconds"])
+        self.assertIsNone(snapshot["next_rotation_seconds"])
 
 
 class UtilityTests(unittest.IsolatedAsyncioTestCase):

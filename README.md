@@ -1,14 +1,16 @@
 # Acid Bot
 
-Acid Bot is a small Discord bot that stays in one voice channel until an authorized controller tells it to leave. It remembers the selected channel across restarts, reconnects after network failures or kicks, and does not play or record audio.
+Acid Bot is a small Discord bot that keeps a presence in one voice channel until an authorized controller tells it to leave. It remembers the selected channel across restarts, reconnects after network failures or kicks, and does not play or record audio.
+
+Optionally, a pool of secondary bot accounts can take turns holding the voice seat. The main bot answers `/voice` commands and is always part of the rotation pool. On a configurable interval (or when the seated bot drops), the next pool member joins the channel *before* the current one disconnects, so the channel is never left empty during handover.
 
 ## What it does
 
 - `/voice join` — join your current voice channel and save it as the target.
 - `/voice move <channel>` — move to another voice channel and save it.
 - `/voice leave` — disconnect and turn off automatic recovery.
-- `/voice rejoin` — reconnect to the last saved channel and turn recovery back on.
-- `/voice status` — show the target, actual connection, uptime, and latest error.
+- `/voice rejoin` — hand the seat to the next pool member and turn recovery back on.
+- `/voice status` — show the target, actual connection, seated bot, rotation countdown, uptime, and latest error.
 
 Only Discord user IDs listed in `AUTHORIZED_USER_IDS` can control the bot; server administrators are not automatically authorized. Replies are visible only to the person who ran the command. The bot supports regular voice channels, not Stage channels.
 
@@ -26,6 +28,15 @@ Only Discord user IDs listed in `AUTHORIZED_USER_IDS` can control the bot; serve
 8. Open the generated installation link, choose your Discord server, and authorize the bot.
 
 The bot intentionally does not request Administrator, Speak, Mute Members, or Move Members.
+
+### Optional: secondary bots for seat rotation
+
+Each secondary bot is a **separate Discord application**. Repeat the steps above for each one, with two differences:
+
+- Only the `bot` scope is required — `applications.commands` is not needed because secondary bots never answer commands.
+- They only need **View Channels** and **Connect** permissions in the server.
+
+Copy each secondary bot's token into `VOICE_BOT_TOKENS`, separated by commas.
 
 ## 2. Get your server and controller IDs
 
@@ -82,6 +93,15 @@ DISCORD_TOKEN=your-real-bot-token
 GUILD_ID=your-server-id
 AUTHORIZED_USER_IDS=your-user-id,another-controller-user-id
 ```
+
+To use seat rotation, add the optional pool settings (see `.env.example` for details):
+
+```dotenv
+VOICE_BOT_TOKENS=secondary-token-1,secondary-token-2
+VOICE_ROTATION_SECONDS=10800
+```
+
+Leave `VOICE_BOT_TOKENS` empty to keep the classic single-bot behavior: the main bot sits in voice permanently.
 
 Save in `nano` with <kbd>Ctrl</kbd>+<kbd>O</kbd>, press <kbd>Enter</kbd>, then exit with <kbd>Ctrl</kbd>+<kbd>X</kbd>. Restrict the file so only your VPS user can read it:
 
@@ -146,6 +166,8 @@ pm2 save
 
 Join a regular voice channel and run `/voice join`. The bot saves that channel in `data/voice_state.json` and reconnects to it after bot restarts, temporary network outages, external moves, or forced disconnects.
 
+With `VOICE_BOT_TOKENS` configured, the voice seat rotates between the main bot and each secondary every `VOICE_ROTATION_SECONDS` (default 10800, i.e. 3 hours). The incoming bot joins the channel first and only then does the outgoing bot disconnect — a make-before-break handover. If the seated bot's voice connection dies before its turn is up, the next pool member takes over immediately instead of waiting for the flaky session to recover. `/voice status` shows which bot currently holds the seat and when the next rotation is due.
+
 Run `/voice leave` before intentionally removing it from voice. This disables recovery but retains the last target, so `/voice rejoin` can resume it later.
 
 ## Local development and tests
@@ -160,6 +182,17 @@ cp .env.example .env           # Windows PowerShell: Copy-Item .env.example .env
 python -m unittest discover -s tests -v
 python bot.py
 ```
+
+`bot.py` is a thin entry point; the code lives in the `acid_bot` package:
+
+- `constants.py` — paths, defaults, shared logger
+- `diagnostics.py` — voice close codes, latency formatters, `DiagnosticVoice*` plumbing
+- `config.py` — `.env` parsing (`Config`)
+- `state.py` — persisted voice target (`StateStore`)
+- `manager.py` — `VoiceManager`: seat pool, make-before-break rotation, watchdog
+- `commands.py` — the `/voice` slash-command group
+- `client.py` — `VoiceBot`: main bot, secondary pool wiring, event logging
+- `main.py` — startup
 
 ## Troubleshooting
 
